@@ -12,6 +12,10 @@
            :ghostty-terminal-send-suspend
            :ghostty-terminal-send-eof
            :ghostty-terminal-send-quit
+           :ghostty-terminal-open-hyperlink
+           :ghostty-terminal-next-hyperlink
+           :ghostty-terminal-previous-hyperlink
+           :create-terminal-with-command
            :ghostty-terminal-resize
            :ghostty-terminal-scroll-up
            :ghostty-terminal-scroll-down))
@@ -90,6 +94,9 @@ The C-c prefix carries the terminal's own control commands, so removing
 (define-key *terminal-mode-keymap* "C-c C-d" 'ghostty-terminal-send-eof)
 (define-key *terminal-mode-keymap* "C-c C-\\" 'ghostty-terminal-send-quit)
 (define-key *terminal-mode-keymap* "C-c C-t" 'ghostty-terminal-copy-mode-on)
+(define-key *terminal-mode-keymap* "C-c C-o" 'ghostty-terminal-open-hyperlink)
+(define-key *terminal-mode-keymap* "C-c C-n" 'ghostty-terminal-next-hyperlink)
+(define-key *terminal-mode-keymap* "C-c C-p" 'ghostty-terminal-previous-hyperlink)
 (define-key *terminal-mode-keymap* "C-c M-d" 'terminal-char-mode)
 (define-key *terminal-mode-keymap* "C-c C-j" 'terminal-mode)
 
@@ -113,6 +120,9 @@ The C-c prefix carries the terminal's own control commands, so removing
 (define-key *terminal-copy-mode-keymap* "Escape" 'ghostty-terminal-copy-mode-off)
 (define-key *terminal-copy-mode-keymap* "C-c C-j" 'terminal-mode)
 (define-key *terminal-copy-mode-keymap* "C-c C-t" 'ghostty-terminal-copy-mode-off)
+(define-key *terminal-copy-mode-keymap* "C-c C-o" 'ghostty-terminal-open-hyperlink)
+(define-key *terminal-copy-mode-keymap* "C-c C-n" 'ghostty-terminal-next-hyperlink)
+(define-key *terminal-copy-mode-keymap* "C-c C-p" 'ghostty-terminal-previous-hyperlink)
 
 ;;; --- commands and helpers --------------------------------------------
 
@@ -125,36 +135,73 @@ The C-c prefix carries the terminal's own control commands, so removing
 (defun get-current-terminal ()
   (buffer-terminal (current-buffer)))
 
-(defun make-terminal-buffer (directory)
+(defun make-terminal-buffer (directory &key (name "*Terminal*")
+                                   program argv (term terminal:*terminal-term*))
   "Create a terminal buffer in DIRECTORY."
-  (let* ((buffer (make-buffer (unique-buffer-name "*Terminal*")
+  (let* ((buffer (make-buffer (unique-buffer-name name)
                               :enable-undo-p nil))
          (terminal (terminal:create :cols 80 :rows 24
                                     :buffer buffer
-                                    :directory directory)))
+                                    :directory directory
+                                    :program program
+                                    :argv argv
+                                    :term term)))
     (setf (buffer-terminal buffer) terminal)
     (change-buffer-mode buffer 'terminal-mode)
     buffer))
 
+(defun remote-terminal-command (path)
+  "Return (values program argv) when PATH names a TRAMP location."
+  (let* ((package (find-package :lem-tramp))
+         (function (and package
+                        (find-symbol "TRAMP-TERMINAL-COMMAND" package))))
+    (when function
+      (funcall function path))))
+
 (define-command ghostty-terminal (always-create-terminal-p) (:universal-nil)
   "Open a ghostty-backed terminal.
 
-The terminal runs the user's shell in the current buffer's directory.  With
-a universal argument a new terminal is always created; otherwise an existing
-terminal buffer is reused."
-  (let ((directory (or (buffer-directory (current-buffer))
-                       (uiop:getcwd))))
-    (if always-create-terminal-p
-        (create-terminal directory)
-        (alexandria:if-let ((buffer (terminal:find-terminal-buffer)))
-          (setf (current-window) (pop-to-buffer buffer))
-          (create-terminal directory)))))
+The terminal runs the user's shell in the current buffer's directory.  From
+a TRAMP buffer the shell is opened on the remote host (through lem-tramp).
+With a universal argument a new terminal is always created; otherwise an
+existing terminal buffer is reused."
+  (let* ((buffer (current-buffer))
+         (path (or (buffer-filename buffer) (buffer-directory buffer))))
+    (multiple-value-bind (program argv) (remote-terminal-command path)
+      (cond
+        ((and program argv)
+         ;; The remote host usually has no xterm-ghostty terminfo entry.
+         (create-terminal-with-command program argv :term "xterm-256color"))
+        (always-create-terminal-p
+         (create-terminal (or (buffer-directory buffer) (uiop:getcwd))))
+        (t
+         (alexandria:if-let ((existing (terminal:find-terminal-buffer)))
+           (setf (current-window) (pop-to-buffer existing))
+           (create-terminal (or (buffer-directory buffer) (uiop:getcwd)))))))))
 
-(defun create-terminal (directory)
-  (let* ((buffer (make-terminal-buffer directory))
+(defun create-terminal (directory &key program argv (term terminal:*terminal-term*))
+  (let* ((buffer (make-terminal-buffer directory
+                                       :program program :argv argv :term term))
          (window (pop-to-buffer buffer)))
     (resize-terminal (buffer-terminal buffer) window)
     (setf (current-window) window)))
+
+(defun create-terminal-with-command (program argv &key (name "*Terminal*")
+                                              directory
+                                              (term terminal:*terminal-term*))
+  "Create a terminal buffer running PROGRAM with ARGV.
+This is the counterpart of `lem-terminal''s helper of the same name: it
+allows other code (and the TRAMP integration) to launch an arbitrary
+program instead of the user's shell."
+  (let* ((buffer (make-terminal-buffer (or directory (uiop:getcwd))
+                                       :name name
+                                       :program program
+                                       :argv argv
+                                       :term term))
+         (window (pop-to-buffer buffer)))
+    (resize-terminal (buffer-terminal buffer) window)
+    (setf (current-window) window)
+    buffer))
 
 (defun on-kill-buffer (buffer)
   (alexandria:when-let ((terminal (buffer-terminal buffer)))
@@ -229,6 +276,91 @@ text under the selection.  Escape or C-c C-j returns to the live terminal."
 (define-command ghostty-terminal-send-quit () ()
   "Send C-\\ (SIGQUIT) to the terminal program."
   (send-control-key "C-\\"))
+
+;;; --- hyperlinks -------------------------------------------------------
+
+(defun open-hyperlink-uri (uri)
+  "Open URI, using Lem for file:// links and xdg-open for everything else."
+  (cond
+    ((and (>= (length uri) 7)
+          (string-equal "file://" uri :end2 7))
+     (let* ((path (subseq uri 7))
+            (slash (position #\/ path)))
+       (if slash
+           (find-file (subseq path slash))
+           (editor-error "Cannot open hyperlink: ~A" uri))))
+    (t
+     (open-external-file uri))))
+
+(defun current-terminal-cell ()
+  (values (1- (line-number-at-point (current-point)))
+          (point-column (current-point))))
+
+(defun terminal-hyperlink-at-point ()
+  (alexandria:when-let* ((terminal (get-current-terminal)))
+    (multiple-value-bind (row col) (current-terminal-cell)
+      (values (terminal:hyperlink-at terminal row col) row col))))
+
+(defun terminal-goto-cell (row col)
+  (move-to-line (current-point) (1+ row))
+  (move-to-column (current-point) col))
+
+(defun scan-link-forward (terminal start-row start-col)
+  (let ((rows (terminal:terminal-rows terminal))
+        (cols (terminal:terminal-cols terminal)))
+    (loop :for offset :below rows
+          :for row := (mod (+ start-row offset) rows)
+          :do (when (terminal:row-has-hyperlink-p terminal row)
+                (loop :for col :from (if (zerop offset) start-col 0) :below cols
+                      :for uri := (terminal:hyperlink-at terminal row col)
+                      :when uri
+                        :do (return-from scan-link-forward
+                              (values uri row col)))))
+    nil))
+
+(defun scan-link-backward (terminal start-row start-col)
+  (let ((rows (terminal:terminal-rows terminal))
+        (cols (terminal:terminal-cols terminal)))
+    (loop :for offset :below rows
+          :for row := (mod (- start-row offset) rows)
+          :do (when (terminal:row-has-hyperlink-p terminal row)
+                (loop :for col :from (if (zerop offset) (1- start-col) (1- cols))
+                        :downto 0
+                      :for uri := (terminal:hyperlink-at terminal row col)
+                      :when uri
+                        :do (return-from scan-link-backward
+                              (values uri row col)))))
+    nil))
+
+(define-command ghostty-terminal-open-hyperlink () ()
+  "Open the OSC 8 hyperlink under point."
+  (multiple-value-bind (uri row col) (terminal-hyperlink-at-point)
+    (declare (ignore row col))
+    (if uri
+        (open-hyperlink-uri uri)
+        (editor-error "No hyperlink at point"))))
+
+(define-command ghostty-terminal-next-hyperlink () ()
+  "Move point to the next OSC 8 hyperlink in the terminal viewport."
+  (alexandria:when-let* ((terminal (get-current-terminal)))
+    (multiple-value-bind (row col) (current-terminal-cell)
+      (multiple-value-bind (uri next-row next-col)
+          (scan-link-forward terminal row (1+ col))
+        (declare (ignore uri))
+        (if next-row
+            (terminal-goto-cell next-row next-col)
+            (editor-error "No hyperlink"))))))
+
+(define-command ghostty-terminal-previous-hyperlink () ()
+  "Move point to the previous OSC 8 hyperlink in the terminal viewport."
+  (alexandria:when-let* ((terminal (get-current-terminal)))
+    (multiple-value-bind (row col) (current-terminal-cell)
+      (multiple-value-bind (uri prev-row prev-col)
+          (scan-link-backward terminal row col)
+        (declare (ignore uri))
+        (if prev-row
+            (terminal-goto-cell prev-row prev-col)
+            (editor-error "No hyperlink"))))))
 
 (define-command ghostty-terminal-copy-mode-on () ()
   "Enter copy mode: stop rendering and keep the current screen."
@@ -364,6 +496,67 @@ normal meaning under any binding."
   "Char input mode dispatch: every key sequence goes to the program."
   (terminal-execute command argument nil
                     (lambda () (call-next-method))))
+
+;;; --- mouse reporting --------------------------------------------------
+
+(defun lem-mouse-button (button)
+  (case button
+    (:button-1 :left)
+    (:button-2 :middle)
+    (:button-3 :right)
+    (t nil)))
+
+(defun terminal-mouse-window-p (window)
+  (let* ((buffer (and window (window-buffer window)))
+         (terminal (and buffer (buffer-terminal buffer)))
+         (mode (and buffer (buffer-major-mode buffer))))
+    (and terminal
+         (member mode '(terminal-mode terminal-char-mode))
+         (terminal:mouse-tracking-active-p terminal)
+         terminal)))
+
+(defun handle-terminal-mouse-event (event)
+  "Send EVENT to the terminal program when mouse tracking is active.
+Returns true when the event was consumed by the terminal."
+  (multiple-value-bind (window x y)
+      (focus-window-position (current-frame)
+                             (lem-core::mouse-event-x event)
+                             (lem-core::mouse-event-y event))
+    (alexandria:when-let* ((terminal (terminal-mouse-window-p window)))
+      (let ((cols (terminal:terminal-cols terminal))
+            (rows (terminal:terminal-rows terminal)))
+        (when (and (<= 0 x) (< x cols) (<= 0 y) (< y rows))
+          (cond
+            ((typep event 'lem-core::mouse-wheel)
+             (let ((dy (lem-core::mouse-wheel-y event)))
+               (unless (zerop dy)
+                 (terminal:send-mouse-event
+                  terminal :press (if (plusp dy) :wheel-down :wheel-up) x y))
+               t))
+            ((typep event 'lem-core::mouse-button-down)
+             (alexandria:when-let* ((button
+                                      (lem-mouse-button
+                                       (lem-core::mouse-event-button event))))
+               (terminal:send-mouse-event terminal :press button x y)
+               t))
+            ((typep event 'lem-core::mouse-button-up)
+             (alexandria:when-let* ((button
+                                      (lem-mouse-button
+                                       (lem-core::mouse-event-button event))))
+               (terminal:send-mouse-event terminal :release button x y)
+               t))
+            ((typep event 'lem-core::mouse-motion)
+             (terminal:send-mouse-event
+              terminal :motion
+              (lem-mouse-button (lem-core::mouse-event-button event))
+              x y)
+             t)
+            (t nil)))))))
+
+(defmethod lem-core::handle-mouse-event :around ((event lem-core::mouse-event))
+  "Let a program with mouse tracking receive the event instead of Lem."
+  (unless (handle-terminal-mouse-event event)
+    (call-next-method)))
 
 (defmethod lem-core:paste-using-mode ((mode terminal-mode) string)
   "Send pasted text to the program, using bracketed paste when enabled."

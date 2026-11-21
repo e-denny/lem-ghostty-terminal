@@ -22,14 +22,22 @@ keys, modifyOtherKeys and Kitty keyboard flags are respected.
   not supported yet.
 - **libghostty-vt 1.0 or newer.** The C ABI is stable from 1.0.
 - **cffi** and **cffi-libffi** (both in Quicklisp). `cffi-libffi` is needed
-  for the two libghostty calls that pass structs by value (viewport
-  scrolling and the UTF-8 text of a key event).
+  for the libghostty calls that pass or return structs by value (viewport
+  scrolling, grid references and the UTF-8 text of a key event).
 - **setsid(1)** on Linux/FreeBSD. SBCL allocates the pty but does not make
   it the child's controlling terminal; running the shell under
   `setsid -c` gives it a session and a controlling terminal so job
   control and Ctrl-C work. Without `setsid -c` the terminal still works,
   but the shell prints "no job control in this shell" and foreground
   signals are unreliable.
+
+Local terminals run with `TERM=xterm-ghostty` and `TERMINFO` pointing at
+the `terminfo/` directory bundled with the extension, so programs discover
+synchronized output, the Kitty keyboard protocol, true colour and the
+other modern capabilities libghostty-vt implements.  Remote terminals
+started through TRAMP use `xterm-256color`, because the remote host is
+unlikely to have the bundled entry installed.  Set
+`LEM_GHOSTTY_VT_TERM` to override the local TERM value.
 
 The repository does not ship the native library. Build it as described
 below and place it at `lib/linux/x64/libghostty-vt.so.1` (or the matching
@@ -95,7 +103,12 @@ the new location.
 ## Using it
 
 - `M-x ghostty-terminal` opens a shell in the current buffer's directory.
-  With a prefix argument it always creates a new terminal buffer.
+  With a prefix argument it always creates a new terminal buffer.  From a
+  TRAMP buffer it opens the shell on the remote host through `lem-tramp`
+  (`ssh -t` / `sudo`).
+- `lem-ghostty-terminal:create-terminal-with-command` starts a terminal
+  running an arbitrary program and argv, for other extensions that want a
+  terminal rather than the user's shell.
 - A terminal starts in **semi-char input mode**, following the model used by
   eat.el and [Ghostel](https://github.com/dakra/ghostel). Most keys go to the
   program, but sequences starting with `C-c`, `C-x`, `C-u`, `M-x`, `M-:` or
@@ -116,12 +129,35 @@ the new location.
 - `C-h` is deliberately not reserved: Lem binds it to
   `delete-previous-char`, and terminals often send Backspace as `^H`, so it
   must reach the program.
-- `PageUp`/`PageDown`, `C-v`/`M-v` and the **mouse wheel** scroll the
-  **terminal viewport** through libghostty-vt's native scrollback rather
-  than moving point through an inserted copy of the history. The wheel uses
-  Lem's `*scroll-speed*` (three rows per notch by default). Typing snaps the
+- `PageUp`/`PageDown` and the **mouse wheel** scroll the **terminal
+  viewport** through libghostty-vt's native scrollback rather than moving
+  point through an inserted copy of the history. The wheel uses Lem's
+  `*scroll-speed*` (three rows per notch by default). Typing snaps the
   viewport back to the live screen. In char mode `PageUp`/`PageDown` are
   sent to the program instead.
+- **Mouse reporting** is forwarded when the program enables it (DEC modes
+  9/1000/1002/1003), using the mode's format (X10, UTF-8, SGR, URXVT or
+  SGR-pixels, with pixel events degraded to SGR cell coordinates).  When
+  mouse tracking is off, clicks and the wheel behave as normal Lem buffer
+  events, so selection and copying still work.
+- **OSC 8 hyperlinks** are read from libghostty's grid. `C-c C-o` opens
+  the link under point, and `C-c C-n` / `C-c C-p` move between links in
+the viewport. These work in semi-char and copy modes.
+- **OSC 52 clipboard writes** are supported (OSC 5522 too) but disabled by
+  default; enable them when you want remote programs or tmux to set the
+  clipboard:
+
+  ```lisp
+  (setf (variable-value 'lem-ghostty-terminal:ghostty-terminal-enable-osc52
+                        :global)
+        t)
+  ```
+
+  The bundled terminfo does not advertise `Ms`, so programs only try OSC
+  52 when you enable it or explicitly ask for it.
+- The terminal title (OSC 0/2) renames the buffer by default.  Set
+  `ghostty-terminal-title-in-buffer-name` to nil to keep `*Terminal*`; a
+  manual rename stops automatic tracking.
 - **Copy mode** (`M-[` or `C-c C-t`): rendering stops, the buffer is frozen,
   normal Lem movement and kill-ring commands can be used, and `Escape` or
   `C-c C-j` returns to the live terminal.
@@ -146,9 +182,13 @@ the new location.
 
 ### Limitations
 
-- No mouse reporting, Kittyp graphics, hyperlinks, notifications or
-  clipboard integration yet. The clipboard works through Lem's normal
-  paste path (`paste-using-mode`), which honours bracketed paste.
+- OSC 52 **reads** are not implemented: programs can write the clipboard,
+  but cannot read it.
+- No Kitty graphics, desktop notifications or progress reports yet. The
+  clipboard paste path still uses Lem's normal `paste-using-mode`, which
+  honours bracketed paste.
+- Mouse modifiers (Ctrl/Meta/Shift + click) are not forwarded because Lem's
+  mouse events do not carry modifier state.
 - No incremental rendering of the non-ASCII width cache beyond what
   libghostty reports; the renderer reads the style of every cell in a
   dirty row.
@@ -166,6 +206,7 @@ the new location.
 ├── terminal-mode.lisp  input modes, keymaps, commands, hooks
 ├── ghostty-terminal.lisp  user-facing package and SETUP
 ├── build-ghostty-vt.lisp  optional libghostty-vt build helper
+├── terminfo/           compiled xterm-ghostty entry (and its source)
 └── lib/<os>/<arch>/    optional vendored libghostty-vt
 ```
 

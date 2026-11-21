@@ -12,6 +12,10 @@
                 :ghostty-terminal-send-suspend
                 :ghostty-terminal-send-eof
                 :ghostty-terminal-send-quit
+                :ghostty-terminal-open-hyperlink
+                :ghostty-terminal-next-hyperlink
+                :ghostty-terminal-previous-hyperlink
+                :create-terminal-with-command
                 :ghostty-terminal-resize
                 :ghostty-terminal-scroll-up
                 :ghostty-terminal-scroll-down)
@@ -20,7 +24,10 @@
                 :*library-path*)
   (:import-from :lem-ghostty-terminal/terminal
                 :ghostty-terminal-render-throttle-ms
-                :ghostty-terminal-close-on-exit)
+                :ghostty-terminal-close-on-exit
+                :ghostty-terminal-enable-osc52
+                :ghostty-terminal-title-in-buffer-name
+                :*terminal-term*)
   (:export :ghostty-terminal
            :terminal-mode
            :terminal-char-mode
@@ -32,6 +39,10 @@
            :ghostty-terminal-send-suspend
            :ghostty-terminal-send-eof
            :ghostty-terminal-send-quit
+           :ghostty-terminal-open-hyperlink
+           :ghostty-terminal-next-hyperlink
+           :ghostty-terminal-previous-hyperlink
+           :create-terminal-with-command
            :ghostty-terminal-resize
            :ghostty-terminal-scroll-up
            :ghostty-terminal-scroll-down
@@ -39,7 +50,10 @@
            :library-available-p
            :*library-path*
            :ghostty-terminal-render-throttle-ms
-           :ghostty-terminal-close-on-exit))
+           :ghostty-terminal-close-on-exit
+           :ghostty-terminal-enable-osc52
+           :ghostty-terminal-title-in-buffer-name
+           :*terminal-term*))
 (in-package :lem-ghostty-terminal)
 
 (defun setup (&key (key "C-c t"))

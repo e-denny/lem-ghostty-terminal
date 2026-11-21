@@ -12,6 +12,10 @@
            :scroll-viewport
            :scroll-to-bottom
            :scrolled-p
+           :mouse-tracking-active-p
+           :send-mouse-event
+           :hyperlink-at
+           :row-has-hyperlink-p
            :send-key
            :send-text
            :adjust-point
@@ -24,7 +28,10 @@
            :copy-mode-on
            :copy-mode-off
            :ghostty-terminal-render-throttle-ms
-           :ghostty-terminal-close-on-exit))
+           :ghostty-terminal-close-on-exit
+           :ghostty-terminal-enable-osc52
+           :ghostty-terminal-title-in-buffer-name
+           :*terminal-term*))
 (in-package :lem-ghostty-terminal/terminal)
 
 ;;; --- configuration ----------------------------------------------------
@@ -48,6 +55,20 @@ and inert.
 
 The last buffer in the editor is never deleted, because Lem needs at least
 one buffer.")
+
+(define-editor-variable ghostty-terminal-enable-osc52 nil
+  "Allow programs to write the clipboard through OSC 52.
+
+Off by default: a remote session can otherwise overwrite the local
+clipboard without asking.  The bundled xterm-ghostty terminfo entry does
+not advertise the `Ms' capability, so programs only use OSC 52 when this is
+enabled and they try it explicitly.")
+
+(define-editor-variable ghostty-terminal-title-in-buffer-name t
+  "Rename the terminal buffer from the program's OSC 0/2 title.
+
+When the program clears its title the buffer returns to `*Terminal*'.  A
+manual rename stops the automatic tracking for that buffer.")
 
 (defparameter *scrollback-max-bytes* (* 10 1024 1024)
   "Scrollback budget handed to libghostty-vt.  It is a page-granular
@@ -114,6 +135,10 @@ terminal is being torn down.")
    (rows :initarg :rows :accessor terminal-rows :type (integer 1 *))
    (cols :initarg :cols :accessor terminal-cols :type (integer 1 *))
    (title :initform nil :accessor terminal-title)
+   (title-pending :initform nil :accessor terminal-title-pending)
+   (managed-buffer-name :initform nil :accessor terminal-managed-buffer-name)
+   (mouse-button-down :initform nil :accessor terminal-mouse-button-down)
+   (mouse-last-cell :initform nil :accessor terminal-mouse-last-cell)
    (copy-mode :initform nil :accessor terminal-copy-mode :type boolean)
    (dead :initform nil :accessor terminal-dead :type boolean
          :documentation "The child process is gone; no more I/O or input.")
@@ -189,14 +214,36 @@ without a native helper."
                 (error () nil))))))
   *setsid-command*)
 
-(defun terminal-environment ()
-  "The parent environment with TERM forced to a capable xterm."
-  (cons "TERM=xterm-256color"
-        (remove-if (lambda (entry)
-                     (eql 0 (search "TERM=" entry)))
-                   (sb-ext:posix-environ))))
+(defparameter *terminal-term* (or (uiop:getenv "LEM_GHOSTTY_VT_TERM")
+                                  "xterm-ghostty")
+  "TERM value used for local terminal programs.
 
-(defun spawn-process (directory program argv)
+xterm-ghostty is backed by the terminfo entry bundled in this extension, so
+programs can discover synchronized output, the Kitty keyboard protocol,
+true colour and the other modern capabilities libghostty-vt implements.")
+
+(defun terminal-terminfo-directory ()
+  (asdf:system-relative-pathname :lem-ghostty-terminal "terminfo/"))
+
+(defun terminal-environment (&key (term *terminal-term*))
+  "The parent environment with TERM (and TERMINFO) set for the terminal."
+  (let* ((terminfo (terminal-terminfo-directory))
+         (bundled (uiop:directory-exists-p terminfo))
+         ;; Do not advertise xterm-ghostty if a checkout is missing the
+         ;; bundled terminfo directory; programs would fail to find it.
+         (term (if (and (string= term "xterm-ghostty") (not bundled))
+                   "xterm-256color"
+                   term))
+         (entries (remove-if (lambda (entry)
+                               (or (eql 0 (search "TERM=" entry))
+                                   (eql 0 (search "TERMINFO=" entry))))
+                             (sb-ext:posix-environ))))
+    (append (list (format nil "TERM=~A" term))
+            (when (and bundled (string= term "xterm-ghostty"))
+              (list (format nil "TERMINFO=~A" (namestring terminfo))))
+            entries)))
+
+(defun spawn-process (directory program argv &key (term *terminal-term*))
   "Start PROGRAM (default: $SHELL) under a fresh PTY, in DIRECTORY.
 ARGV, when given, is the full argument vector including the program name,
 matching the convention of `lem-terminal'; it is trimmed to the arguments
@@ -206,7 +253,8 @@ SBCL wants.  Returns the PROCESS."
          (arguments (cond ((null argv) nil)
                           ((equal (first argv) program) (rest argv))
                           (t argv)))
-         (setsid (setsid-command)))
+         (setsid (setsid-command))
+         (environment (terminal-environment :term term)))
     (if setsid
         (sb-ext:run-program setsid
                             (append (list "-c" program) arguments)
@@ -214,14 +262,14 @@ SBCL wants.  Returns the PROCESS."
                             :wait nil
                             :search t
                             :directory directory
-                            :environment (terminal-environment))
+                            :environment environment)
         (sb-ext:run-program program
                             arguments
                             :pty t
                             :wait nil
                             :search t
                             :directory directory
-                            :environment (terminal-environment)))))
+                            :environment environment))))
 
 (defun process-fd (process)
   "The master side of PROCESS's pty."
@@ -289,10 +337,34 @@ already runs inside a locked VT write)."
   (declare (ignore id)))
 
 (defun handle-title (id)
-  "Effect callback: the title changed.  Reading it requires the terminal
-lock, which the I/O thread already holds while parsing, so the title is
-refreshed after the next render instead."
-  (declare (ignore id)))
+  "Effect callback: mark the title for refresh on the editor thread.
+Reading the title needs the terminal lock, which the I/O thread holds while
+parsing, so the actual read happens during the next render."
+  (alexandria:when-let ((terminal (find-terminal-by-id id)))
+    (setf (terminal-title-pending terminal) t)
+    (setf (terminal-pending terminal) t)
+    (arm-render-timer terminal)))
+
+(defun clipboard-text (contents)
+  "Pick the first text representation from a clipboard CONTENTS alist."
+  (alexandria:when-let ((entry
+                          (find-if (lambda (entry)
+                                     (and (stringp (car entry))
+                                          (search "text/" (car entry)
+                                                  :test #'char-equal)))
+                                   contents)))
+    (cdr entry)))
+
+(defun handle-clipboard-write (id location contents)
+  "Effect callback: OSC 52 / OSC 5522 clipboard write.
+Runs on the I/O thread, so it queues the actual clipboard update on the
+editor thread and answers the program immediately."
+  (declare (ignore id location))
+  (when (variable-value 'ghostty-terminal-enable-osc52 :global)
+    (let ((text (or (clipboard-text contents) "")))
+      (send-event (lambda ()
+                    (ignore-errors (copy-to-clipboard text))))
+      t)))
 
 (defun close-terminal-buffer (terminal)
   "Delete TERMINAL's buffer after its process exited.
@@ -624,6 +696,47 @@ later."
           (move-to-line point (1+ y))
           (move-to-column point x))))))
 
+(defun sanitize-buffer-title (title)
+  "Make TITLE usable as a Lem buffer name, or NIL when it is empty."
+  (when title
+    (let ((clean (map 'string
+                      (lambda (char)
+                        (if (or (< (char-code char) 32)
+                                (= (char-code char) 127))
+                            #\Space
+                            char))
+                      title)))
+      (setf clean (string-trim '(#\Space #\Tab) clean))
+      (when (plusp (length clean))
+        (subseq clean 0 (min 80 (length clean)))))))
+
+(defun apply-buffer-title (terminal title)
+  "Rename TERMINAL's buffer from TITLE, unless the user renamed it."
+  (let* ((buffer (terminal-buffer terminal))
+         (managed (terminal-managed-buffer-name terminal))
+         (current (buffer-name buffer)))
+    (when (and managed (not (string= current managed)))
+      ;; The user renamed it; stop managing the name.
+      (setf managed nil)
+      (setf (terminal-managed-buffer-name terminal) nil))
+    (when managed
+      (let* ((base (or (sanitize-buffer-title title) "*Terminal*"))
+             (desired (if (string= base current)
+                          current
+                          (unique-buffer-name base))))
+        (unless (string= desired current)
+          (buffer-rename buffer desired)
+          (setf (terminal-managed-buffer-name terminal) desired))))))
+
+(defun update-buffer-title (terminal)
+  "Consume a pending title change on the editor thread."
+  (when (terminal-title-pending terminal)
+    (setf (terminal-title-pending terminal) nil)
+    (setf (terminal-title terminal)
+          (ffi:terminal-title (terminal-vt terminal)))
+    (when (variable-value 'ghostty-terminal-title-in-buffer-name :global)
+      (apply-buffer-title terminal (terminal-title terminal)))))
+
 (defun render (terminal)
   "Redraw the terminal buffer.
 CONTRACT: the caller must hold TERMINAL-LOCK.  The render state is the only
@@ -669,7 +782,8 @@ lock is held."
                                             (line-at first-line row))))))))))
         (ffi:render-state-clean state)))
     ;; Cursor-only movement marks no row dirty, but point must follow it.
-    (update-cursor terminal)))
+    (update-cursor terminal)
+    (update-buffer-title terminal)))
 
 (defun adjust-point (terminal)
   "Move point to the terminal cursor, rendering first if needed."
@@ -724,6 +838,128 @@ tests and from the REPL; the interactive path uses the render timer."
   "True while the viewport shows scrollback instead of the active area."
   (bt2:with-lock-held ((terminal-lock terminal))
     (not (ffi:terminal-viewport-active-p (terminal-vt terminal)))))
+
+;;; --- mouse ------------------------------------------------------------
+
+(defun mouse-tracking-active-p (terminal)
+  "True when the program has enabled any terminal mouse tracking mode."
+  (bt2:with-lock-held ((terminal-lock terminal))
+    (ffi:terminal-mouse-tracking-p (terminal-vt terminal))))
+
+(defun mouse-button-index (button)
+  (case button
+    (:left 0)
+    (:middle 1)
+    (:right 2)
+    (:wheel-up 64)
+    (:wheel-down 65)
+    (t 3)))
+
+(defun mouse-tracking-mode (terminal)
+  (let ((vt (terminal-vt terminal)))
+    (cond ((ffi:terminal-mode-value vt 1003) :any)
+          ((ffi:terminal-mode-value vt 1002) :button)
+          ((ffi:terminal-mode-value vt 1000) :normal)
+          ((ffi:terminal-mode-value vt 9) :x10)
+          (t nil))))
+
+(defun mouse-format (terminal)
+  (let ((vt (terminal-vt terminal)))
+    ;; SGR-pixels (1016) is rare; cell coordinates in SGR form keep the
+    ;; protocol useful without tracking the font's pixel size.
+    (cond ((ffi:terminal-mode-value vt 1016) :sgr)
+          ((ffi:terminal-mode-value vt 1006) :sgr)
+          ((ffi:terminal-mode-value vt 1015) :urxvt)
+          ((ffi:terminal-mode-value vt 1005) :utf8)
+          (t :x10))))
+
+(defun encode-mouse-event (terminal action button x y format)
+  "Return the bytes for a mouse event in FORMAT, or NIL."
+  (declare (ignore terminal))
+  (let* ((x (max 0 x))
+         (y (max 0 y))
+         (index (mouse-button-index button))
+         (code (case action
+                 (:release (if (eq format :x10) 3 index))
+                 (:motion (+ 32 index))
+                 (t index))))
+    (ecase format
+      (:x10
+       (when (and (<= x 222) (<= y 222))
+         (let ((string (make-string 6)))
+           (setf (char string 0) #\Escape
+                 (char string 1) #\[
+                 (char string 2) #\M
+                 (char string 3) (code-char (+ 32 code))
+                 (char string 4) (code-char (+ 33 x))
+                 (char string 5) (code-char (+ 33 y)))
+           (sb-ext:string-to-octets string :external-format :utf-8))))
+      (:utf8
+       (let ((string (concatenate 'string
+                                  (string #\Escape) "[M"
+                                  (string (code-char (+ 32 code)))
+                                  (string (code-char (+ 33 x)))
+                                  (string (code-char (+ 33 y))))))
+         (sb-ext:string-to-octets string :external-format :utf-8)))
+      (:sgr
+       (sb-ext:string-to-octets
+        (format nil "~C[<~D;~D;~D~C"
+                #\Escape code (1+ x) (1+ y)
+                (if (eq action :release) #\m #\M))
+        :external-format :utf-8))
+      (:urxvt
+       (sb-ext:string-to-octets
+        (format nil "~C[~D;~D;~DM" #\Escape (+ 32 code) (1+ x) (1+ y))
+        :external-format :utf-8)))))
+
+(defun send-mouse-event (terminal action button x y)
+  "Encode and send a mouse event to TERMINAL's program.
+ACTION is :press, :release or :motion.  X and Y are viewport cell
+coordinates.  Does nothing when mouse tracking is off or the event is not
+part of the active tracking mode."
+  (when (terminal-alive-p terminal)
+    (bt2:with-lock-held ((terminal-lock terminal))
+      (when (and (not (terminal-dead terminal))
+                 (ffi:terminal-mouse-tracking-p (terminal-vt terminal)))
+        (let* ((mode (mouse-tracking-mode terminal))
+               (format (mouse-format terminal))
+               (wheel (member button '(:wheel-up :wheel-down)))
+               (report
+                 (case mode
+                   (:x10 (eq action :press))
+                   (:normal (member action '(:press :release)))
+                   (:button (or (member action '(:press :release))
+                                (and (eq action :motion)
+                                     (or (terminal-mouse-button-down terminal)
+                                         button))))
+                   (:any t)
+                   (t nil))))
+          (when (and report
+                     (not (and (eq format :x10) (eq action :motion)))
+                     (not (and (eq action :motion)
+                               (equal (list x y)
+                                      (terminal-mouse-last-cell terminal)))))
+            (setf (terminal-mouse-last-cell terminal) (list x y))
+            (when (and (not wheel) (eq action :press))
+              (setf (terminal-mouse-button-down terminal) t))
+            (when (and (not wheel) (eq action :release))
+              (setf (terminal-mouse-button-down terminal) nil))
+            (alexandria:when-let ((bytes
+                                    (encode-mouse-event terminal action
+                                                        button x y format)))
+              (write-octets terminal bytes))))))))
+
+;;; --- hyperlinks -------------------------------------------------------
+
+(defun hyperlink-at (terminal row col)
+  "Return the OSC 8 URI at viewport cell ROW, COL, or NIL."
+  (bt2:with-lock-held ((terminal-lock terminal))
+    (ffi:terminal-grid-ref-hyperlink-uri (terminal-vt terminal) col row)))
+
+(defun row-has-hyperlink-p (terminal row)
+  "True when viewport row ROW contains at least one OSC 8 hyperlink."
+  (bt2:with-lock-held ((terminal-lock terminal))
+    (ffi:terminal-row-has-hyperlink-p (terminal-vt terminal) row)))
 
 ;;; --- input ------------------------------------------------------------
 
@@ -822,7 +1058,7 @@ octet vector, or NIL when the key produces no output."
 
 ;;; --- lifecycle --------------------------------------------------------
 
-(defun make-terminal-object (&key id buffer rows cols process)
+(defun make-terminal-object (&key id buffer rows cols process (term *terminal-term*))
   (let ((vt (ffi:terminal-new cols rows)))
     (handler-case
         (let* ((render-state (ffi:render-state-new))
@@ -845,8 +1081,13 @@ octet vector, or NIL when the key produces no output."
                             (cffi:callback ffi:cb-write-pty))
           (ffi:terminal-set vt ffi:+opt-bell+
                             (cffi:callback ffi:cb-bell))
+          (ffi:terminal-set vt ffi:+opt-title-changed+
+                            (cffi:callback ffi:cb-title))
           (ffi:terminal-set vt ffi:+opt-device-attributes+
                             (cffi:callback ffi:cb-device-attributes))
+          (ffi:terminal-set vt ffi:+opt-clipboard-write+
+                            (cffi:callback ffi:cb-clipboard-write))
+          (ffi:terminal-set-terminfo-name vt term)
           (setf (cffi:mem-ref iterator-container :pointer)
                 (ffi:row-iterator-new)
                 (cffi:mem-ref cells-container :pointer)
@@ -882,19 +1123,22 @@ octet vector, or NIL when the key produces no output."
     (setf (cffi:mem-ref value :size) bytes)
     (ffi:terminal-set vt ffi:+opt-scrollback-max-bytes+ value)))
 
-(defun create (&key rows cols buffer directory (program nil) (argv nil))
+(defun create (&key rows cols buffer directory (program nil) (argv nil)
+                 (term *terminal-term*))
   "Create a terminal running PROGRAM (default: the user's shell) in
 DIRECTORY and display it in BUFFER.  ROWS and COLS are the initial grid."
   (unless (ffi:load-library)
     (editor-error "libghostty-vt is not installed: build or install it and set LEM_GHOSTTY_VT_LIBRARY"))
-  (let* ((process (spawn-process directory program argv))
+  (let* ((process (spawn-process directory program argv :term term))
          (id (next-terminal-id))
          (terminal (make-terminal-object :id id :buffer buffer
                                          :rows rows :cols cols
+                                         :term term
                                          :process process)))
     ;; The pty starts with no usable winsize; a program that asks before the
     ;; first editor resize would otherwise assume 80x24.
     (set-pty-window-size terminal rows cols)
+    (setf (terminal-managed-buffer-name terminal) (buffer-name buffer))
     (push terminal *terminals*)
     (setf (terminal-thread terminal)
           (bt2:make-thread
@@ -954,3 +1198,4 @@ in the shell can trigger the close without leaking the native state."
 (ffi:set-write-pty-function 'handle-write-pty)
 (ffi:set-bell-function 'handle-bell)
 (ffi:set-title-function 'handle-title)
+(ffi:set-clipboard-write-function 'handle-clipboard-write)

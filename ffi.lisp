@@ -19,6 +19,28 @@
            :terminal-scrollback-rows
            :terminal-total-rows
            :terminal-viewport-active-p
+           :terminal-mouse-tracking-p
+           :terminal-grid-ref-hyperlink-uri
+           :terminal-row-has-hyperlink-p
+           :terminal-set-terminfo-name
+           ;; mouse
+           :mouse-encoder-new
+           :mouse-encoder-free
+           :mouse-encoder-set-size
+           :mouse-encoder-sync
+           :mouse-encoder-encode
+           :mouse-event-new
+           :mouse-event-free
+           :mouse-event-set-press
+           :mouse-event-set-release
+           :mouse-event-set-motion
+           :mouse-event-clear-button
+           :mouse-event-set-position
+           :+mouse-button-left+
+           :+mouse-button-right+
+           :+mouse-button-middle+
+           :+mouse-button-four+
+           :+mouse-button-five+
            ;; render state
            :render-state-new
            :render-state-free
@@ -66,9 +88,11 @@
            :set-write-pty-function
            :set-bell-function
            :set-title-function
+           :set-clipboard-write-function
            :cb-write-pty
            :cb-bell
            :cb-title
+           :cb-clipboard-write
            :cb-device-attributes
            ;; constants used by the terminal layer
            :+result-success+
@@ -76,12 +100,16 @@
            :+opt-userdata+
            :+opt-write-pty+
            :+opt-bell+
+           :+opt-title-changed+
            :+opt-device-attributes+
            :+opt-scrollback-max-bytes+
            :+opt-scrollback-max-lines+
+           :+opt-clipboard-write+
+           :+opt-terminfo-name+
            :+term-data-cols+
            :+term-data-rows+
            :+term-data-title+
+           :+term-data-mouse-tracking+
            :+term-data-total-rows+
            :+term-data-scrollback-rows+
            :+term-data-viewport-active+
@@ -197,20 +225,24 @@ second call after success is a no-op unless FORCE is true."
 (defconstant +result-success+ 0)
 (defconstant +result-invalid-value+ -1)
 (defconstant +result-no-value+ -4)
-(defconstant +result-out-of-space+ -6)
+(defconstant +result-out-of-space+ -3)
 
 ;; GhosttyTerminalOption
 (defconstant +opt-userdata+ 1)
 (defconstant +opt-write-pty+ 2)
 (defconstant +opt-bell+ 3)
+(defconstant +opt-title-changed+ 6)
 (defconstant +opt-device-attributes+ 9)
 (defconstant +opt-scrollback-max-bytes+ 28)
 (defconstant +opt-scrollback-max-lines+ 29)
+(defconstant +opt-clipboard-write+ 27)
+(defconstant +opt-terminfo-name+ 38)
 
 ;; GhosttyTerminalData
 (defconstant +term-data-cols+ 1)
 (defconstant +term-data-rows+ 2)
 (defconstant +term-data-title+ 12)
+(defconstant +term-data-mouse-tracking+ 11)
 (defconstant +term-data-total-rows+ 14)
 (defconstant +term-data-scrollback-rows+ 15)
 (defconstant +term-data-viewport-active+ 32)
@@ -226,6 +258,26 @@ second call after success is a no-op unless FORCE is true."
 
 ;; GhosttyRenderStateRowData
 (defconstant +row-data-cells+ 3)
+(defconstant +row-data-viewport-y+ 6)
+
+;; Mouse
+(defconstant +mouse-action-press+ 0)
+(defconstant +mouse-action-release+ 1)
+(defconstant +mouse-action-motion+ 2)
+(defconstant +mouse-button-left+ 1)
+(defconstant +mouse-button-right+ 2)
+(defconstant +mouse-button-middle+ 3)
+(defconstant +mouse-button-four+ 4)
+(defconstant +mouse-button-five+ 5)
+(defconstant +mouse-encoder-opt-size+ 3)
+(defconstant +mouse-encoder-opt-track-last-cell+ 5)
+
+;; GhosttyPointTag
+(defconstant +point-tag-viewport+ 1)
+
+;; GhosttyClipboardWriteResult
+(defconstant +clipboard-write-success+ 0)
+(defconstant +clipboard-write-unsupported+ 2)
 
 ;; GhosttyRenderStateRowCellsData
 (defconstant +cells-data-style+ 2)
@@ -358,6 +410,55 @@ first; anything else becomes GHOSTTY_KEY_UNIDENTIFIED and is sent as text.")
   (value :uint8)
   (padding :uint8))
 
+;; GhosttyPoint: tag int, padding to 8, then a 16-byte union whose first
+;; member is { uint16 x; uint32 y; } with its own trailing padding.
+(cffi:defcstruct ghostty-point
+  (tag :int)
+  (padding :int)
+  (x :uint16)
+  (y-padding :uint16)
+  (y :uint32)
+  (union-padding :uint64))
+
+(cffi:defcstruct ghostty-grid-ref
+  (node :pointer)
+  (x :uint16)
+  (y :uint16))
+
+(cffi:defcstruct ghostty-mouse-position
+  (x :float)
+  (y :float))
+
+(cffi:defcstruct ghostty-mouse-encoder-size
+  (size :size)
+  (screen-width :uint32)
+  (screen-height :uint32)
+  (cell-width :uint32)
+  (cell-height :uint32)
+  (padding-top :uint32)
+  (padding-bottom :uint32)
+  (padding-right :uint32)
+  (padding-left :uint32))
+
+(cffi:defcstruct ghostty-clipboard-content
+  (mime (:struct ghostty-string))
+  (data (:struct ghostty-string)))
+
+(cffi:defcstruct ghostty-clipboard-write
+  (location :int)
+  (contents :pointer)
+  (contents-len :size)
+  (name (:struct ghostty-string))
+  (granted :boolean)
+  (can-remember :boolean)
+  (ctx :pointer)
+  (reply :pointer))
+
+(cffi:defcstruct ghostty-clipboard-write-reply
+  (size :size)
+  (result :int)
+  (remember :boolean))
+
 ;;; --- terminal ---------------------------------------------------------
 
 (cffi:defcfun ("ghostty_terminal_new" %terminal-new) :int
@@ -395,8 +496,79 @@ first; anything else becomes GHOSTTY_KEY_UNIDENTIFIED and is sent as text.")
   (terminal :pointer)
   (behavior (:struct ghostty-scroll-viewport)))
 
+(cffi:defcfun ("ghostty_terminal_grid_ref" %terminal-grid-ref) :int
+  (terminal :pointer)
+  (point (:struct ghostty-point))
+  (out-ref :pointer))
+
+(cffi:defcfun ("ghostty_grid_ref_row" %grid-ref-row) :int
+  (ref :pointer)
+  (out-row :pointer))
+
+(cffi:defcfun ("ghostty_row_get" %row-data-get) :int
+  (row :uint64)
+  (data :int)
+  (out :pointer))
+
+(cffi:defcfun ("ghostty_grid_ref_hyperlink_uri" %grid-ref-hyperlink-uri) :int
+  (ref :pointer)
+  (buffer :pointer)
+  (buffer-len :size)
+  (out-written :pointer))
+
 (cffi:defcfun ("ghostty_unicode_codepoint_width" %codepoint-width) :uint8
   (codepoint :uint32))
+
+;;; --- mouse ------------------------------------------------------------
+
+(cffi:defcfun ("ghostty_mouse_encoder_new" %mouse-encoder-new) :int
+  (allocator :pointer)
+  (out (:pointer :pointer)))
+
+(cffi:defcfun ("ghostty_mouse_encoder_free" %mouse-encoder-free) :void
+  (encoder :pointer))
+
+(cffi:defcfun ("ghostty_mouse_encoder_set" %mouse-encoder-set) :int
+  (encoder :pointer)
+  (option :int)
+  (value :pointer))
+
+(cffi:defcfun ("ghostty_mouse_encoder_set_from_terminal" %mouse-encoder-sync) :int
+  (encoder :pointer)
+  (terminal :pointer))
+
+(cffi:defcfun ("ghostty_mouse_encoder_encode" %mouse-encoder-encode) :int
+  (encoder :pointer)
+  (event :pointer)
+  (buffer :pointer)
+  (buffer-len :size)
+  (out-written :pointer))
+
+(cffi:defcfun ("ghostty_mouse_event_new" %mouse-event-new) :int
+  (allocator :pointer)
+  (out (:pointer :pointer)))
+
+(cffi:defcfun ("ghostty_mouse_event_free" %mouse-event-free) :void
+  (event :pointer))
+
+(cffi:defcfun ("ghostty_mouse_event_set_action" %mouse-event-set-action) :int
+  (event :pointer)
+  (action :int))
+
+(cffi:defcfun ("ghostty_mouse_event_set_button" %mouse-event-set-button) :int
+  (event :pointer)
+  (button :int))
+
+(cffi:defcfun ("ghostty_mouse_event_clear_button" %mouse-event-clear-button) :int
+  (event :pointer))
+
+(cffi:defcfun ("ghostty_mouse_event_set_position" %mouse-event-set-position) :int
+  (event :pointer)
+  (position (:struct ghostty-mouse-position)))
+
+(cffi:defcfun ("ghostty_mouse_event_get_position" %mouse-event-get-position)
+    (:struct ghostty-mouse-position)
+  (event :pointer))
 
 ;;; --- render state -----------------------------------------------------
 
@@ -516,6 +688,11 @@ the program.  Must write the bytes to the PTY.")
 (defvar *title-function* nil
   "Called as (ID) when the terminal title changes.")
 
+(defvar *clipboard-write-function* nil
+  "Called as (ID LOCATION CONTENTS) for a clipboard write request.
+CONTENTS is an alist of (MIME . DATA).  The function returns true when the
+clipboard write was accepted, false to answer UNSUPPORTED.")
+
 (defun set-write-pty-function (function)
   (setf *write-pty-function* function))
 
@@ -524,6 +701,9 @@ the program.  Must write the bytes to the PTY.")
 
 (defun set-title-function (function)
   (setf *title-function* function))
+
+(defun set-clipboard-write-function (function)
+  (setf *clipboard-write-function* function))
 
 (defun userdata-id (userdata)
   "The integer terminal id we stored in the callback userdata pointer."
@@ -546,6 +726,59 @@ the program.  Must write the bytes to the PTY.")
   (declare (ignore terminal))
   (when *title-function*
     (funcall *title-function* (userdata-id userdata))))
+
+(defun foreign-string-value (string-struct)
+  "Decode a GhosttyString structure at STRING-STRUCT."
+  (cffi:with-foreign-slots ((ptr len) string-struct (:struct ghostty-string))
+    (if (zerop len)
+        ""
+        (handler-case
+            (cffi:foreign-string-to-lisp ptr :count len :encoding :utf-8)
+          (error ()
+            (cffi:foreign-string-to-lisp ptr :count len :encoding :iso-8859-1))))))
+
+(cffi:defcallback cb-clipboard-write :void
+    ((terminal :pointer) (userdata :pointer) (write :pointer))
+  (declare (ignore terminal))
+  (let* ((contents-len (cffi:foreign-slot-value
+                        write '(:struct ghostty-clipboard-write) 'contents-len))
+         (contents-ptr (cffi:foreign-slot-value
+                        write '(:struct ghostty-clipboard-write) 'contents))
+         (location (cffi:foreign-slot-value
+                    write '(:struct ghostty-clipboard-write) 'location))
+         (contents
+           (loop :for i :below contents-len
+                 :for item := (cffi:mem-aptr contents-ptr
+                                             '(:struct ghostty-clipboard-content)
+                                             i)
+                 :collect (cons (foreign-string-value
+                                 (cffi:foreign-slot-pointer
+                                  item '(:struct ghostty-clipboard-content) 'mime))
+                                (foreign-string-value
+                                 (cffi:foreign-slot-pointer
+                                  item '(:struct ghostty-clipboard-content) 'data)))))
+         (accepted (and *clipboard-write-function*
+                        (funcall *clipboard-write-function*
+                                 (userdata-id userdata)
+                                 location
+                                 contents)))
+         (reply-fn (cffi:foreign-slot-value
+                    write '(:struct ghostty-clipboard-write) 'reply)))
+    (unless (or (null reply-fn) (cffi:null-pointer-p reply-fn))
+      (cffi:with-foreign-object (reply '(:struct ghostty-clipboard-write-reply))
+        (setf (cffi:foreign-slot-value
+               reply '(:struct ghostty-clipboard-write-reply) 'size)
+              (cffi:foreign-type-size '(:struct ghostty-clipboard-write-reply))
+              (cffi:foreign-slot-value
+               reply '(:struct ghostty-clipboard-write-reply) 'result)
+              (if accepted +clipboard-write-success+ +clipboard-write-unsupported+)
+              (cffi:foreign-slot-value
+               reply '(:struct ghostty-clipboard-write-reply) 'remember)
+              nil)
+        (cffi:foreign-funcall-pointer reply-fn nil
+                                      :pointer write
+                                      :pointer reply
+                                      :void)))))
 
 (cffi:defcallback cb-device-attributes :boolean
     ((terminal :pointer) (userdata :pointer) (attributes :pointer))
@@ -638,6 +871,157 @@ not expose a portable character pixel size."
       (cffi:with-foreign-slots ((ptr len) out (:struct ghostty-string))
         (when (plusp len)
           (cffi:foreign-string-to-lisp ptr :count len :encoding :utf-8))))))
+
+(defun terminal-mouse-tracking-p (terminal)
+  (cffi:with-foreign-object (out :uint8)
+    (and (= (terminal-get terminal +term-data-mouse-tracking+ out)
+            +result-success+)
+         (not (zerop (cffi:mem-ref out :uint8))))))
+
+(defun terminal-set-terminfo-name (terminal name)
+  "Tell the terminal what TERM name to report for XTGETTCAP TN."
+  (cffi:with-foreign-string (ptr name)
+    (cffi:with-foreign-object (value '(:struct ghostty-string))
+      (setf (cffi:foreign-slot-value value '(:struct ghostty-string) 'ptr) ptr
+            (cffi:foreign-slot-value value '(:struct ghostty-string) 'len)
+            (length name))
+      (terminal-set terminal +opt-terminfo-name+ value))))
+
+(defun make-viewport-point (x y)
+  "Allocate a GhosttyPoint for viewport cell X, Y.  Caller frees."
+  (let ((point (cffi:foreign-alloc '(:struct ghostty-point))))
+    (setf (cffi:foreign-slot-value point '(:struct ghostty-point) 'tag)
+          +point-tag-viewport+
+          (cffi:foreign-slot-value point '(:struct ghostty-point) 'x) x
+          (cffi:foreign-slot-value point '(:struct ghostty-point) 'y) y)
+    point))
+
+(defun with-viewport-grid-ref (terminal x y function)
+  (let ((point (make-viewport-point x y)))
+    (unwind-protect
+         (cffi:with-foreign-object (ref '(:struct ghostty-grid-ref))
+           (when (= (%terminal-grid-ref terminal
+                                        (cffi:mem-ref point '(:struct ghostty-point))
+                                        ref)
+                    +result-success+)
+             (funcall function ref)))
+      (cffi:foreign-free point))))
+
+(defun terminal-grid-ref-hyperlink-uri (terminal x y)
+  "Return the OSC 8 URI of viewport cell X, Y, or NIL."
+  (with-viewport-grid-ref
+      terminal x y
+    (lambda (ref)
+      (cffi:with-foreign-object (needed :size)
+        (let ((result (%grid-ref-hyperlink-uri ref (cffi:null-pointer) 0 needed)))
+          (cond
+            ((zerop (cffi:mem-ref needed :size))
+             nil)
+            ((= result +result-out-of-space+)
+             (let ((len (cffi:mem-ref needed :size)))
+               (cffi:with-foreign-object (buffer :uint8 len)
+                 (when (= (%grid-ref-hyperlink-uri ref buffer len needed)
+                          +result-success+)
+                   (cffi:foreign-string-to-lisp buffer :count len :encoding :utf-8)))))
+            (t nil)))))))
+
+(defun terminal-row-has-hyperlink-p (terminal y)
+  "True when viewport row Y contains any OSC 8 hyperlink."
+  (with-viewport-grid-ref
+      terminal 0 y
+    (lambda (ref)
+      (cffi:with-foreign-object (row :uint64)
+        (when (= (%grid-ref-row ref row) +result-success+)
+          (cffi:with-foreign-object (flag :uint8)
+            (and (= (%row-data-get (cffi:mem-ref row :uint64) 5 flag)
+                    +result-success+)
+                 (not (zerop (cffi:mem-ref flag :uint8))))))))))
+
+;;; --- mouse wrappers ---------------------------------------------------
+
+(defun mouse-encoder-new ()
+  (cffi:with-foreign-object (out :pointer)
+    (check (%mouse-encoder-new (cffi:null-pointer) out)
+           "could not create mouse encoder")
+    (cffi:mem-ref out :pointer)))
+
+(defun mouse-encoder-free (encoder)
+  (when (and encoder (not (cffi:null-pointer-p encoder)))
+    (%mouse-encoder-free encoder)))
+
+(defun mouse-encoder-set-size (encoder cols rows)
+  "Set the encoder geometry to COLS by ROWS cells of one pixel."
+  (cffi:with-foreign-object (size '(:struct ghostty-mouse-encoder-size))
+    (setf (cffi:foreign-slot-value size '(:struct ghostty-mouse-encoder-size) 'size)
+          (cffi:foreign-type-size '(:struct ghostty-mouse-encoder-size))
+          (cffi:foreign-slot-value size '(:struct ghostty-mouse-encoder-size) 'screen-width)
+          cols
+          (cffi:foreign-slot-value size '(:struct ghostty-mouse-encoder-size) 'screen-height)
+          rows
+          (cffi:foreign-slot-value size '(:struct ghostty-mouse-encoder-size) 'cell-width)
+          1
+          (cffi:foreign-slot-value size '(:struct ghostty-mouse-encoder-size) 'cell-height)
+          1
+          (cffi:foreign-slot-value size '(:struct ghostty-mouse-encoder-size) 'padding-top)
+          0
+          (cffi:foreign-slot-value size '(:struct ghostty-mouse-encoder-size) 'padding-bottom)
+          0
+          (cffi:foreign-slot-value size '(:struct ghostty-mouse-encoder-size) 'padding-right)
+          0
+          (cffi:foreign-slot-value size '(:struct ghostty-mouse-encoder-size) 'padding-left)
+          0)
+    (%mouse-encoder-set encoder +mouse-encoder-opt-size+ size)
+    (cffi:with-foreign-object (flag :uint8)
+      (setf (cffi:mem-ref flag :uint8) 1)
+      (%mouse-encoder-set encoder +mouse-encoder-opt-track-last-cell+ flag))))
+
+(defun mouse-encoder-sync (encoder terminal)
+  (%mouse-encoder-sync encoder terminal))
+
+(defun mouse-encoder-encode (encoder event buffer buffer-len out-written)
+  (%mouse-encoder-encode encoder event buffer buffer-len out-written))
+
+(defun mouse-event-new ()
+  (cffi:with-foreign-object (out :pointer)
+    (check (%mouse-event-new (cffi:null-pointer) out)
+           "could not create mouse event")
+    (cffi:mem-ref out :pointer)))
+
+(defun mouse-event-free (event)
+  (when (and event (not (cffi:null-pointer-p event)))
+    (%mouse-event-free event)))
+
+(defun mouse-event-set-press (event button x y)
+  (check (%mouse-event-set-action event +mouse-action-press+) "mouse action")
+  (check (%mouse-event-set-button event button) "mouse button")
+  (set-position event x y))
+
+(defun mouse-event-set-release (event button x y)
+  (check (%mouse-event-set-action event +mouse-action-release+) "mouse action")
+  (check (%mouse-event-set-button event button) "mouse button")
+  (set-position event x y))
+
+(defun mouse-event-set-motion (event button x y)
+  (check (%mouse-event-set-action event +mouse-action-motion+) "mouse action")
+  (if button
+      (check (%mouse-event-set-button event button) "mouse button")
+      (%mouse-event-clear-button event))
+  (set-position event x y))
+
+(defun mouse-event-clear-button (event)
+  (%mouse-event-clear-button event))
+
+(defun mouse-event-set-position (event x y)
+  (set-position event x y))
+
+(defun set-position (event x y)
+  (cffi:with-foreign-object (position '(:struct ghostty-mouse-position))
+    (setf (cffi:foreign-slot-value position '(:struct ghostty-mouse-position) 'x)
+          (float x)
+          (cffi:foreign-slot-value position '(:struct ghostty-mouse-position) 'y)
+          (float y))
+    (%mouse-event-set-position event
+                               (cffi:mem-ref position '(:struct ghostty-mouse-position)))))
 
 ;;; --- struct accessors -------------------------------------------------
 ;;;
