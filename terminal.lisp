@@ -227,6 +227,37 @@ SBCL wants.  Returns the PROCESS."
   "The master side of PROCESS's pty."
   (sb-sys:fd-stream-fd (sb-ext:process-pty process)))
 
+;;; --- PTY window size ---------------------------------------------------
+
+;; ioctl request to set struct winsize on the pty.  Linux uses a plain
+;; _IOW('t', 103, struct winsize); the BSDs and macOS use the sized form.
+(defconstant +tiocswinsz+
+  #+linux #x5414
+  #+(or darwin freebsd) #x80087467
+  #-(or linux darwin freebsd) #x5414)
+
+(cffi:defcfun ("ioctl" %ioctl) :int
+  (fd :int)
+  (request :unsigned-long)
+  (arg :pointer))
+
+(defun set-pty-window-size (terminal rows cols)
+  "Tell the program in TERMINAL that its window is ROWS by COLS.
+
+libghostty-vt only knows the grid size.  The child asks the kernel for its
+window size separately, with TIOCGWINSZ on the pty slave, and programs use
+that to lay out prompts and full-screen UIs.  The ioctl also makes the
+kernel send SIGWINCH to the foreground process group, so full-screen
+programs redraw at the new size."
+  (cffi:with-foreign-object (winsize :uint16 4)
+    ;; struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel; }
+    (setf (cffi:mem-aref winsize :uint16 0) rows
+          (cffi:mem-aref winsize :uint16 1) cols
+          (cffi:mem-aref winsize :uint16 2) 0
+          (cffi:mem-aref winsize :uint16 3) 0)
+    (ignore-errors
+      (%ioctl (terminal-fd terminal) +tiocswinsz+ winsize))))
+
 ;;; --- I/O thread -------------------------------------------------------
 
 (defun write-to-pty (terminal pointer length)
@@ -667,6 +698,7 @@ tests and from the REPL; the interactive path uses the render timer."
             (terminal-size-changed terminal) t)
       (ffi:terminal-resize (terminal-vt terminal) cols rows)
       (clear-attribute-cache terminal))
+    (set-pty-window-size terminal rows cols)
     (setf (terminal-pending terminal) t)
     (arm-render-timer terminal)))
 
@@ -860,6 +892,9 @@ DIRECTORY and display it in BUFFER.  ROWS and COLS are the initial grid."
          (terminal (make-terminal-object :id id :buffer buffer
                                          :rows rows :cols cols
                                          :process process)))
+    ;; The pty starts with no usable winsize; a program that asks before the
+    ;; first editor resize would otherwise assume 80x24.
+    (set-pty-window-size terminal rows cols)
     (push terminal *terminals*)
     (setf (terminal-thread terminal)
           (bt2:make-thread
