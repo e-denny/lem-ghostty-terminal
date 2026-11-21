@@ -200,8 +200,15 @@ NIL and mean 'one page'.  A universal argument may arrive as a list."
 
 ;;; --- mode dispatch ----------------------------------------------------
 
-(defmethod execute ((mode terminal-mode) command argument)
+(defmethod execute :around ((mode terminal-mode) command argument)
   "Route typing to the terminal; page scrolling moves the terminal viewport.
+
+This is an :AROUND method on purpose.  Several Lem commands -- notably
+`delete-previous-char', which Backspace is bound to -- install their own
+execute :around method and never call the next method.  An around method
+on the terminal mode is more specific than those (the mode specializer is
+compared before the command specializer), so it runs first and the key
+reaches the shell instead of editing the read-only buffer.
 
 Other commands (window management, prompts) keep their normal meaning.  Any
 remaining command is treated as typed input, matching how a terminal behaves:
