@@ -44,6 +44,21 @@ below and place it at `lib/linux/x64/libghostty-vt.so.1` (or the matching
 `lib/<os>/<arch>/` directory), install libghostty-vt system-wide, or point
 `LEM_GHOSTTY_VT_LIBRARY` at an existing build.
 
+Icons from programs such as `eza --icons` need a Nerd Font named in the
+frontend font stack.  The server/webview frontend paints buffer text on a
+canvas and WebKitGTK does not apply fontconfig fallback to Private Use Area
+codepoints, so a stack with only the editor's text font draws every icon as
+a `.notdef` box.  Give `set-font` a second family:
+
+```lisp
+(lem:set-font :name "Adwaita Mono, \"SauceCodePro Nerd Font Mono\"" :size 16)
+```
+
+SauceCodePro Nerd Font Mono has the same advance as Adwaita Mono, so the
+character grid is unchanged.  This is a frontend limitation rather than an
+extension one: libghostty-vt decodes the icon cells correctly, so the ncurses
+frontend is unaffected (the outer terminal picks the glyph).
+
 ## Building libghostty-vt
 
 libghostty-vt is written in Zig and released separately from Ghostty
@@ -192,6 +207,9 @@ the viewport. These work in semi-char and copy modes.
 - No incremental rendering of the non-ASCII width cache beyond what
   libghostty reports; the renderer reads the style of every cell in a
   dirty row.
+- Nerd Font icons render only when the frontend font stack names a Nerd
+  Font family, as described under Requirements; a single-family stack leaves
+  them as `.notdef` boxes in the webview frontend.
 - SBCL only, for the PTY layer described above.
 - The process is not suspended with Ctrl-Z at the editor level; Ctrl-Z is
   sent to the program, which is what a terminal should do.
