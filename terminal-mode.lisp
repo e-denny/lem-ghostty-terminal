@@ -2,10 +2,16 @@
   (:use :cl :lem)
   (:local-nicknames (:terminal :lem-ghostty-terminal/terminal))
   (:export :terminal-mode
+           :terminal-char-mode
            :terminal-copy-mode
+           :*keymap-exceptions*
            :ghostty-terminal
            :ghostty-terminal-copy-mode-on
            :ghostty-terminal-copy-mode-off
+           :ghostty-terminal-send-interrupt
+           :ghostty-terminal-send-suspend
+           :ghostty-terminal-send-eof
+           :ghostty-terminal-send-quit
            :ghostty-terminal-resize
            :ghostty-terminal-scroll-up
            :ghostty-terminal-scroll-down))
@@ -14,7 +20,8 @@
 ;;; --- mode dispatch table ----------------------------------------------
 
 ;;; Commands that must keep their normal Lem meaning inside the terminal:
-;;; window management, prompts, and the terminal's own control commands.
+;;; window management, prompts, mode switches and the terminal's own control
+;;; commands.
 (defvar *bypass-commands*
   '(next-window
     previous-window
@@ -30,6 +37,9 @@
     kill-buffer
     find-file
     execute-command
+    terminal-mode
+    terminal-char-mode
+    terminal-copy-mode
     ghostty-terminal-resize
     ghostty-terminal-copy-mode-on
     ghostty-terminal-copy-mode-off
@@ -41,25 +51,68 @@
 
 ;;; --- keymaps ----------------------------------------------------------
 
+(defparameter *keymap-exceptions*
+  '("C-c" "C-x" "C-u" "M-x" "M-:" "C-\\")
+  "Keys that stay Lem's in semi-char mode.
+
+Semi-char mode is the default: everything else is sent to the program,
+but a key sequence that starts with one of these keys is left to Lem, so
+C-x C-c quits the editor, M-x reaches the command loop, and so on.  Char
+mode ignores this list and sends every key to the program.
+
+C-h is deliberately not listed: Lem binds it to `delete-previous-char',
+and terminals commonly send backspace as ^H, so it has to reach the shell.
+The C-c prefix carries the terminal's own control commands, so removing
+\"C-c\" from this list also makes them unreachable from semi-char mode.")
+
 (defvar *terminal-mode-keymap* (make-keymap :description "Terminal"))
+(defvar *terminal-char-mode-keymap* (make-keymap :description "Terminal (Char)"))
 (defvar *terminal-copy-mode-keymap* (make-keymap :description "Terminal (Copy)"))
 
+;; Plain characters are not bound in either input keymap; they resolve
+;; through the undefined-key hook and are remapped to TERMINAL-INPUT.
 (define-key *terminal-mode-keymap* 'self-insert 'terminal-input)
 (define-key *terminal-mode-keymap* 'undefined-key 'terminal-input)
-(define-key *terminal-mode-keymap* "C-h" 'terminal-input)
+(define-key *terminal-char-mode-keymap* 'self-insert 'terminal-input)
+(define-key *terminal-char-mode-keymap* 'undefined-key 'terminal-input)
 
-;; Control keys that Lem would otherwise treat as editor bindings (C-c and
-;; C-x are prefixes, C-s/C-q are flow control, C-z suspends, C-\ is a
-;; prefix too) must reach the program.  This is why the terminal is opened
-;; from outside with a prefix of your choice, not with C-c inside it.
-(dolist (key '("C-c" "C-x" "C-z" "C-s" "C-q" "C-g" "C-\\"))
+;; Control keys that semi-char mode still sends raw.  C-c and C-x are
+;; exceptions (they stay Lem prefixes); C-\ is an exception too and is
+;; available as C-c C-\ below.
+(dolist (key '("C-z" "C-s" "C-q" "C-g"))
   (define-key *terminal-mode-keymap* key 'terminal-input))
 
-;; C-x is needed by programs, so copy mode has its own binding.
+;; C-c is reserved in semi-char mode for terminal control, following the
+;; eat.el/Ghostel convention.  Sequences not listed here (for example a
+;; user's own C-c t) fall through to the normal Lem binding.
+(define-key *terminal-mode-keymap* "C-c C-c" 'ghostty-terminal-send-interrupt)
+(define-key *terminal-mode-keymap* "C-c C-z" 'ghostty-terminal-send-suspend)
+(define-key *terminal-mode-keymap* "C-c C-d" 'ghostty-terminal-send-eof)
+(define-key *terminal-mode-keymap* "C-c C-\\" 'ghostty-terminal-send-quit)
+(define-key *terminal-mode-keymap* "C-c C-t" 'ghostty-terminal-copy-mode-on)
+(define-key *terminal-mode-keymap* "C-c M-d" 'terminal-char-mode)
+(define-key *terminal-mode-keymap* "C-c C-j" 'terminal-mode)
+
+;; Copy mode, from semi-char.  M-[ is kept as the quick binding; inside
+;; copy mode Escape returns to the live terminal.
 (define-key *terminal-mode-keymap* "M-[" 'ghostty-terminal-copy-mode-on)
 (define-key *terminal-mode-keymap* "PageUp" 'ghostty-terminal-scroll-up)
 (define-key *terminal-mode-keymap* "PageDown" 'ghostty-terminal-scroll-down)
+
+;; Char mode sends everything, including the semi-char exceptions.  Each
+;; key is a leaf binding, so C-x is sent immediately instead of opening a
+;; prefix.  M-Return is the single escape hatch, as in Ghostel.
+(dolist (key *keymap-exceptions*)
+  (define-key *terminal-char-mode-keymap* key 'terminal-input))
+(define-key *terminal-char-mode-keymap* "M-Return" 'terminal-mode)
+;; PageUp/PageDown belong to the program in char mode.  Binding them here
+;; also keeps the mode dispatch from turning them into viewport scrolls.
+(define-key *terminal-char-mode-keymap* "PageUp" 'terminal-input)
+(define-key *terminal-char-mode-keymap* "PageDown" 'terminal-input)
+
 (define-key *terminal-copy-mode-keymap* "Escape" 'ghostty-terminal-copy-mode-off)
+(define-key *terminal-copy-mode-keymap* "C-c C-j" 'terminal-mode)
+(define-key *terminal-copy-mode-keymap* "C-c C-t" 'ghostty-terminal-copy-mode-off)
 
 ;;; --- commands and helpers --------------------------------------------
 
@@ -107,16 +160,34 @@ terminal buffer is reused."
   (alexandria:when-let ((terminal (buffer-terminal buffer)))
     (terminal:destroy terminal)))
 
-(define-major-mode terminal-mode ()
-    (:name "Terminal"
-     :keymap *terminal-mode-keymap*)
-  "Major mode for a terminal buffer drawn by libghostty-vt."
+(defun initialize-terminal-buffer ()
   (setf (buffer-read-only-p (current-buffer)) t)
   (setf (variable-value 'highlight-line :buffer (current-buffer)) nil)
   (setf (variable-value 'line-wrap :buffer (current-buffer)) nil)
   (setf (variable-value 'lem/show-paren:enable :buffer (current-buffer)) nil)
   (add-hook (variable-value 'kill-buffer-hook :buffer (current-buffer))
-            'on-kill-buffer)
+            'on-kill-buffer))
+
+(define-major-mode terminal-mode ()
+    (:name "Terminal"
+     :keymap *terminal-mode-keymap*)
+  "Major mode for a live terminal buffer drawn by libghostty-vt.
+
+This is semi-char input mode, the default: most keys go to the program,
+while the prefixes in `*keymap-exceptions*' stay Lem's.  C-c C-c sends an
+interrupt, C-c M-d switches to char mode, and C-c C-t enters copy mode."
+  (initialize-terminal-buffer)
+  (alexandria:when-let ((terminal (get-current-terminal)))
+    (terminal:copy-mode-off terminal)))
+
+(define-major-mode terminal-char-mode ()
+    (:name "Terminal (Char)"
+     :keymap *terminal-char-mode-keymap*)
+  "Major mode for a live terminal buffer in char input mode.
+
+Every key is sent to the program, including the prefixes that semi-char
+mode reserves for Lem.  M-Return returns to semi-char mode."
+  (initialize-terminal-buffer)
   (alexandria:when-let ((terminal (get-current-terminal)))
     (terminal:copy-mode-off terminal)))
 
@@ -126,13 +197,8 @@ terminal buffer is reused."
   "Major mode that freezes a terminal buffer so its text can be copied.
 
 Rendering stops while this mode is active, so the shell cannot overwrite the
-text under the selection."
-  (setf (buffer-read-only-p (current-buffer)) t)
-  (setf (variable-value 'highlight-line :buffer (current-buffer)) nil)
-  (setf (variable-value 'line-wrap :buffer (current-buffer)) nil)
-  (setf (variable-value 'lem/show-paren:enable :buffer (current-buffer)) nil)
-  (add-hook (variable-value 'kill-buffer-hook :buffer (current-buffer))
-            'on-kill-buffer)
+text under the selection.  Escape or C-c C-j returns to the live terminal."
+  (initialize-terminal-buffer)
   (alexandria:when-let ((terminal (get-current-terminal)))
     (terminal:copy-mode-on terminal)))
 
@@ -141,6 +207,28 @@ text under the selection."
   (alexandria:when-let ((terminal (get-current-terminal)))
     (dolist (key (last-read-key-sequence))
       (terminal:send-key terminal key))))
+
+(defun send-control-key (keyspec)
+  "Send the single key named by KEYSPEC to the terminal."
+  (alexandria:when-let ((terminal (get-current-terminal)))
+    (dolist (key (parse-keyspec keyspec))
+      (terminal:send-key terminal key))))
+
+(define-command ghostty-terminal-send-interrupt () ()
+  "Send C-c (SIGINT) to the terminal program."
+  (send-control-key "C-c"))
+
+(define-command ghostty-terminal-send-suspend () ()
+  "Send C-z (SIGTSTP) to the terminal program."
+  (send-control-key "C-z"))
+
+(define-command ghostty-terminal-send-eof () ()
+  "Send C-d (end of file) to the terminal program."
+  (send-control-key "C-d"))
+
+(define-command ghostty-terminal-send-quit () ()
+  "Send C-\\ (SIGQUIT) to the terminal program."
+  (send-control-key "C-\\"))
 
 (define-command ghostty-terminal-copy-mode-on () ()
   "Enter copy mode: stop rendering and keep the current screen."
@@ -200,22 +288,42 @@ NIL and mean 'one page'.  A universal argument may arrive as a list."
 
 ;;; --- mode dispatch ----------------------------------------------------
 
-(defmethod execute :around ((mode terminal-mode) command argument)
-  "Route typing to the terminal; page scrolling moves the terminal viewport.
+(defun key-same-p (a b)
+  "True when keys A and B are the same key."
+  (and (eq (key-ctrl a) (key-ctrl b))
+       (eq (key-meta a) (key-meta b))
+       (eq (key-super a) (key-super b))
+       (eq (key-hyper a) (key-hyper b))
+       (eq (key-shift a) (key-shift b))
+       (equal (key-sym a) (key-sym b))))
 
-This is an :AROUND method on purpose.  Several Lem commands -- notably
-`delete-previous-char', which Backspace is bound to -- install their own
-execute :around method and never call the next method.  An around method
-on the terminal mode is more specific than those (the mode specializer is
-compared before the command specializer), so it runs first and the key
-reaches the shell instead of editing the read-only buffer.
+(defvar *parsed-keymap-exceptions* nil
+  "Cache of `*keymap-exceptions*' parsed into key lists.")
 
-Other commands (window management, prompts) keep their normal meaning.  Any
-remaining command is treated as typed input, matching how a terminal behaves:
-pressing a key must reach the shell rather than run an editor command."
+(defun parsed-keymap-exceptions ()
+  (unless (eq (car *parsed-keymap-exceptions*) *keymap-exceptions*)
+    (setf *parsed-keymap-exceptions*
+          (cons *keymap-exceptions*
+                (mapcar #'parse-keyspec *keymap-exceptions*))))
+  (cdr *parsed-keymap-exceptions*))
+
+(defun exception-key-sequence-p (keys exceptions)
+  "True when KEYS starts with one of the EXCEPTIONS key lists."
+  (some (lambda (prefix)
+          (and (<= (length prefix) (length keys))
+               (loop :for p :in prefix
+                     :for k :in keys
+                     :always (key-same-p p k))))
+        exceptions))
+
+(defun terminal-execute (command argument exceptions next)
+  "Shared dispatch for the terminal input modes.
+
+EXCEPTIONS is nil in char mode and the parsed `*keymap-exceptions*' in
+semi-char mode.  NEXT calls the next most specific EXECUTE method."
   (cond
     ((member command *bypass-commands* :test #'typep)
-     (call-next-method))
+     (funcall next))
     ((typep command 'scroll-up)
      (let ((rows (scroll-row-count argument)))
        (if rows
@@ -226,10 +334,43 @@ pressing a key must reach the shell rather than run an editor command."
        (if rows
            (scroll-terminal rows)
            (ghostty-terminal-scroll-down))))
+    ;; Commands invoked programmatically, from M-x, or by the mouse have no
+    ;; key sequence to send; let them run normally.
+    ((null (last-read-key-sequence))
+     (funcall next))
+    ((exception-key-sequence-p (last-read-key-sequence) exceptions)
+     (funcall next))
     (t
      (terminal-input))))
 
+(defmethod execute :around ((mode terminal-mode) command argument)
+  "Semi-char input mode dispatch.
+
+This is an :AROUND method on purpose.  Several Lem commands -- notably
+`delete-previous-char', which Backspace is bound to -- install their own
+execute :around method and never call the next method.  An around method
+on the terminal mode is more specific than those (the mode specializer is
+compared before the command specializer), so it runs first and the key
+reaches the shell instead of editing the read-only buffer.
+
+Key sequences that start with a key from `*keymap-exceptions*' keep their
+normal Lem meaning (C-x C-c quits, M-x opens the command loop); every
+other key goes to the program.  Window management and prompts keep their
+normal meaning under any binding."
+  (terminal-execute command argument (parsed-keymap-exceptions)
+                    (lambda () (call-next-method))))
+
+(defmethod execute :around ((mode terminal-char-mode) command argument)
+  "Char input mode dispatch: every key sequence goes to the program."
+  (terminal-execute command argument nil
+                    (lambda () (call-next-method))))
+
 (defmethod lem-core:paste-using-mode ((mode terminal-mode) string)
+  "Send pasted text to the program, using bracketed paste when enabled."
+  (alexandria:when-let ((terminal (get-current-terminal)))
+    (terminal:send-text terminal string)))
+
+(defmethod lem-core:paste-using-mode ((mode terminal-char-mode) string)
   "Send pasted text to the program, using bracketed paste when enabled."
   (alexandria:when-let ((terminal (get-current-terminal)))
     (terminal:send-text terminal string)))

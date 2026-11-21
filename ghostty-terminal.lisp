@@ -1,9 +1,17 @@
 (uiop:define-package :lem-ghostty-terminal
   (:use :cl :lem)
   (:import-from :lem-ghostty-terminal/terminal-mode
+                :terminal-mode
+                :terminal-char-mode
+                :terminal-copy-mode
+                :*keymap-exceptions*
                 :ghostty-terminal
                 :ghostty-terminal-copy-mode-on
                 :ghostty-terminal-copy-mode-off
+                :ghostty-terminal-send-interrupt
+                :ghostty-terminal-send-suspend
+                :ghostty-terminal-send-eof
+                :ghostty-terminal-send-quit
                 :ghostty-terminal-resize
                 :ghostty-terminal-scroll-up
                 :ghostty-terminal-scroll-down)
@@ -14,8 +22,16 @@
                 :ghostty-terminal-render-throttle-ms
                 :ghostty-terminal-close-on-exit)
   (:export :ghostty-terminal
+           :terminal-mode
+           :terminal-char-mode
+           :terminal-copy-mode
+           :*keymap-exceptions*
            :ghostty-terminal-copy-mode-on
            :ghostty-terminal-copy-mode-off
+           :ghostty-terminal-send-interrupt
+           :ghostty-terminal-send-suspend
+           :ghostty-terminal-send-eof
+           :ghostty-terminal-send-quit
            :ghostty-terminal-resize
            :ghostty-terminal-scroll-up
            :ghostty-terminal-scroll-down

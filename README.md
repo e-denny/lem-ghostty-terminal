@@ -75,9 +75,10 @@ This tree is a user extension: it lives in
 
 ```lisp
 ;;; libghostty-vt backed terminal.
-;;; C-c t opens it from a normal buffer.  Inside the terminal C-c is sent
-;;; to the program, so use M-x ghostty-terminal or the same command from
-;;; another window to open another one.
+;;; C-c t opens it from a normal buffer or from inside a semi-char terminal.
+;;; In the terminal, C-c is a prefix for terminal control (C-c C-c sends an
+;;; interrupt); C-x C-c quits Lem.  Char mode (C-c M-d) sends every key,
+;;; including C-c and C-x, to the program.
 (pushnew (merge-pathnames "extensions/ghostty-terminal/" (lem-home))
          asdf:*central-registry*
          :test #'equal)
@@ -95,19 +96,36 @@ the new location.
 
 - `M-x ghostty-terminal` opens a shell in the current buffer's directory.
   With a prefix argument it always creates a new terminal buffer.
-- Typing goes to the program. Application cursor keys, Kitty keyboard
-  protocol, bracketed paste, `modifyOtherKeys`, Ctrl-C/Ctrl-X/Ctrl-Z and
-  the other control keys are passed through rather than interpreted by
-  Lem.
+- A terminal starts in **semi-char input mode**, following the model used by
+  eat.el and [Ghostel](https://github.com/dakra/ghostel). Most keys go to the
+  program, but sequences starting with `C-c`, `C-x`, `C-u`, `M-x`, `M-:` or
+  `C-\` stay Lem's, so `C-x C-c` quits the editor and `M-x` works normally.
+  The exception list is `lem-ghostty-terminal:*keymap-exceptions*`.
+- Terminal control keys live under the reserved `C-c` prefix:
+
+  | Key | Sends |
+  |-----|-------|
+  | `C-c C-c` | `C-c` (SIGINT) |
+  | `C-c C-z` | `C-z` (SIGTSTP) |
+  | `C-c C-d` | `C-d` (end of file) |
+  | `C-c C-\` | `C-\` (SIGQUIT) |
+
+- **Char input mode** (`C-c M-d`) sends every key to the program, including
+  `C-x`, `C-c` and `M-x`, for TUIs that bind those themselves. `M-Return`
+  returns to semi-char mode.
+- `C-h` is deliberately not reserved: Lem binds it to
+  `delete-previous-char`, and terminals often send Backspace as `^H`, so it
+  must reach the program.
 - `PageUp`/`PageDown`, `C-v`/`M-v` and the **mouse wheel** scroll the
   **terminal viewport** through libghostty-vt's native scrollback rather
   than moving point through an inserted copy of the history. The wheel uses
   Lem's `*scroll-speed*` (three rows per notch by default). Typing snaps the
-  viewport back to the live screen.
-- `M-[` enters copy mode: rendering stops, the buffer is frozen, normal
-  Lem movement and kill-ring commands can be used, and `Escape` returns to
-  the live terminal. `M-x ghostty-terminal-copy-mode-on`/`-off` do the
-  same.
+  viewport back to the live screen. In char mode `PageUp`/`PageDown` are
+  sent to the program instead.
+- **Copy mode** (`M-[` or `C-c C-t`): rendering stops, the buffer is frozen,
+  normal Lem movement and kill-ring commands can be used, and `Escape` or
+  `C-c C-j` returns to the live terminal.
+  `M-x ghostty-terminal-copy-mode-on`/`-off` do the same.
 - The terminal grid follows the window size automatically.
 - When the child process exits, for example when you type `exit` in the
   shell, the terminal buffer is deleted and its window switches back to the
@@ -145,7 +163,7 @@ the new location.
 ├── lem-ghostty-terminal.asd  ASDF system definition
 ├── ffi.lisp            CFFI bindings, structs, effect dispatchers
 ├── terminal.lisp       PTY, I/O thread, render timer, renderer, input
-├── terminal-mode.lisp  major modes, keymaps, commands, hooks
+├── terminal-mode.lisp  input modes, keymaps, commands, hooks
 ├── ghostty-terminal.lisp  user-facing package and SETUP
 ├── build-ghostty-vt.lisp  optional libghostty-vt build helper
 └── lib/<os>/<arch>/    optional vendored libghostty-vt
