@@ -880,7 +880,7 @@ tests and from the REPL; the interactive path uses the render timer."
          (y (max 0 y))
          (index (mouse-button-index button))
          (code (case action
-                 (:release (if (eq format :x10) 3 index))
+                 (:release (if (eq format :sgr) index 3))
                  (:motion (+ 32 index))
                  (t index))))
     (ecase format
